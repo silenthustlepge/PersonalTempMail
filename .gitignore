@@ -9,6 +9,26 @@ backend/tokens.json
 backend/pubsub-service-account.json
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+# Node.js dependencies
+/node_modules
+
+# Environment variables - contains secrets!
+.env
+
+# Google API Tokens - contains secrets!
+/backend/tokens.json
+
+# Local state and data files - should not be in version control
+/backend/state.json
+/backend/emails.json
+/backend/emergent_logins.json
+
+# Build output
+/build
+
+# Log files
+*.log
+
 # IDE and editors
 .idea/
 .vscode/
