@@ -194,66 +194,81 @@ app.post('/webhook/pubsub-push', async (req, res) => {
     res.status(204).send(); // Acknowledge immediately
     try {
         let state;
-        try { state = JSON.parse(await fs.readFile(STATE_PATH, 'utf-8')); }
-        catch (error) { console.error('CRITICAL: state.json missing. Run start-watch.js'); return; }
+        try {
+            state = JSON.parse(await fs.readFile(STATE_PATH, 'utf-8'));
+        } catch (error) {
+            console.error('CRITICAL: state.json missing. Run start-watch.js');
+            return;
+        }
 
         const gmailClient = await getAuthenticatedClient();
         const historyResponse = await gmailClient.users.history.list({
-            userId: 'me', startHistoryId: state.lastHistoryId, historyTypes: ['messageAdded'],
+            userId: 'me',
+            startHistoryId: state.lastHistoryId,
+            historyTypes: ['messageAdded'],
         });
 
         const history = historyResponse.data.history;
-        if (!history || history.length === 0) return;
+        if (!history || history.length === 0) {
+            // No new history, nothing to do.
+            return;
+        }
 
         for (const record of history) {
             if (!record.messagesAdded) continue;
+
             for (const msgAdded of record.messagesAdded) {
                 const messageId = msgAdded.message.id;
                 let msgResponse;
                 try {
                     msgResponse = await gmailClient.users.messages.get({ userId: 'me', id: messageId, format: 'full' });
                 } catch (err) {
-                    if (err.code === 404) {
-                        console.warn(`(Draft?) Message not found (ID: ${messageId}), likely deleted. Skipping.`);
-                        continue;
+                    if (err && err.code === 404) {
+                        console.warn(`Gmail message not found (ID: ${messageId}), likely already deleted. Skipping.`);
+                        continue; // Skip this message
                     }
-                    throw err;
+                    throw err; // Re-throw other errors
                 }
-
-                // --- THE DEFINITIVE FIX: Only process messages in the INBOX ---
-                if (!msgResponse.data.labelIds || !msgResponse.data.labelIds.includes('INBOX')) {
-                    console.log(`Skipping message (ID: ${messageId}) because it's not in the INBOX. Labels: ${msgResponse.data.labelIds ? msgResponse.data.labelIds.join(', ') : 'none'}`);
-                    continue;
-                }
-                // --- END OF FIX ---
 
                 const { payload } = msgResponse.data;
                 const targetAddress = normalizeEmailAddress(parseHeader(payload.headers, 'Delivered-To') || parseHeader(payload.headers, 'To'));
+                const subject = parseHeader(payload.headers, 'Subject') || '(no subject)';
+                const body = parseMessageBody(payload);
 
+                // Filter out empty/useless emails and those with only '(no subject)'
+                if ((!subject || subject === '(no subject)') && (!body || body.trim() === '')) {
+                    console.log(`Skipping email with no subject and no body (ID: ${messageId})`);
+                    continue;
+                }
+                if (subject === '(no subject)') {
+                    console.log(`Skipping email with subject '(no subject)' (ID: ${messageId})`);
+                    continue;
+                }
+
+                // Check if we are tracking this address
                 if (receivedEmails.hasOwnProperty(targetAddress)) {
-                    // Idempotency check: prevent duplicates from Pub/Sub retries
-                    const emailAlreadyExists = receivedEmails[targetAddress].some(email => email.id === messageId);
-                    if (emailAlreadyExists) {
-                        console.log(`Duplicate INBOX message (ID: ${messageId}) detected. Skipping.`);
-                        continue;
-                    }
-
-                    const subject = parseHeader(payload.headers, 'Subject') || '(no subject)';
+                    // Create the full email data object
                     const emailData = {
                         id: messageId,
                         from: parseHeader(payload.headers, 'From'),
                         subject,
-                        body: parseMessageBody(payload),
+                        body,
                         date: parseHeader(payload.headers, 'Date'),
                         address: targetAddress
                     };
-
-                    receivedEmails[targetAddress].unshift(emailData);
-                    console.log(`✅ Broadcasting INBOX email for ${targetAddress} with subject: "${subject}"`);
-                    broadcast({ type: 'NEW_EMAIL', data: emailData });
+                    // Prevent duplicate emails by id
+                    if (!receivedEmails[targetAddress].some(e => e.id === messageId)) {
+                        receivedEmails[targetAddress].unshift(emailData);
+                        // 2. Broadcast the COMPLETE new email data object
+                        console.log(`Broadcasting new email for ${targetAddress} with subject: "${subject}"`);
+                        broadcast({ type: 'NEW_EMAIL', data: emailData });
+                    } else {
+                        console.log(`Duplicate email with id ${messageId} for ${targetAddress} ignored.`);
+                    }
                 }
             }
         }
+        // IMPORTANT: Update the state file with the new latest historyId
         await fs.writeFile(STATE_PATH, JSON.stringify({ lastHistoryId: historyResponse.data.historyId }, null, 2));
     } catch (error) {
         console.error('FATAL Error in Pub/Sub sync:', error);
