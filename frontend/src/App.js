@@ -114,9 +114,10 @@ function App() {
                 setError('No address returned from backend.');
                 return;
             }
-            setCurrentAddress(newAddress);
+            const lowerCaseAddress = newAddress.toLowerCase();
+            setCurrentAddress(lowerCaseAddress);
             setSuccess('New address generated!');
-            fetchEmails(newAddress);
+            fetchEmails(lowerCaseAddress);
         },
         onError: setError,
     });
@@ -124,9 +125,10 @@ function App() {
     const { execute: doHandleLoadAddress, isLoading: isLoadingAddress } = useApiAction(checkAddress, {
         onSuccess: (data, address) => {
             if (data.isValid) {
-                setCurrentAddress(address);
+                const lowerCaseAddress = address.toLowerCase();
+                setCurrentAddress(lowerCaseAddress);
                 setSuccess('Address loaded!');
-                fetchEmails(address);
+                fetchEmails(lowerCaseAddress);
             } else {
                 setError('This is not a valid or active address from our service.');
                 setCurrentAddress('');
@@ -150,7 +152,7 @@ function App() {
         }
         resetSession();
         setShowWelcome(false);
-        doHandleLoadAddress(addressToCheck);
+        doHandleLoadAddress(addressToCheck.trim());
     };
 
     const { execute: doHandleRetireAddress, isLoading: isRetiringAddress } = useApiAction(retireAddress, {
