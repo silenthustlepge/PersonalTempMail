@@ -1,68 +1,86 @@
 // App.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import DOMPurify from 'dompurify';
 import './App.css';
-import axios from 'axios';
-axios.defaults.headers.common['ngrok-skip-browser-warning'] = 'true';
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'https://primary-lemming-noble.ngrok-free.app';
-const API = `${BACKEND_URL}/api`;
+import {
+    apiClient,
+    getNewAddress,
+    checkAddress,
+    retireAddress,
+    fetchInbox
+} from './services/api';
+import { useEmergentAuth } from './hooks/useEmergentAuth';
+import { useApiAction } from './hooks/useApiAction';
+import { EmergentAuthModals } from './components/EmergentAuthModals';
 
 function App() {
     // --- State ---
     const [currentAddress, setCurrentAddress] = useState('');
     const [addressToCheck, setAddressToCheck] = useState('');
     const [inbox, setInbox] = useState([]);
-    const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState('');
     const [success, setSuccess] = useState('');
     const [selectedEmail, setSelectedEmail] = useState(null);
     const [showWelcome, setShowWelcome] = useState(true);
-    // WebSocket ref
     const wsRef = useRef(null);
+    const addressRef = useRef(currentAddress);
+    const emergentAuth = useEmergentAuth(setSuccess);
+    
+    // Memoize the calculation of unique emails to prevent re-running on every render.
+    // This improves performance, especially with a large inbox.
+    const uniqueEmails = useMemo(() => {
+        const seenIds = new Set();
+        const unique = [];
+        // Filter out emails without a subject and duplicates based on ID
+        for (const email of inbox) {
+            if (email.subject && email.subject !== '(no subject)' && !seenIds.has(email.id)) {
+                seenIds.add(email.id);
+                unique.push(email);
+            }
+        }
+        return unique;
+    }, [inbox]);
 
-    // Emergent Login Modal State
-    const [showEmergentModal, setShowEmergentModal] = useState(false);
-    const [emergentEmail, setEmergentEmail] = useState('');
-    const [emergentName, setEmergentName] = useState('');
-    const [emergentPassword, setEmergentPassword] = useState('');
-    const [emergentSaveMsg, setEmergentSaveMsg] = useState('');
-    // Emergent Check State
-    const [showEmergentCheck, setShowEmergentCheck] = useState(false);
-    const [emergentCheckEmail, setEmergentCheckEmail] = useState('');
-    const [emergentCheckResult, setEmergentCheckResult] = useState(null);
-    const [emergentCheckMsg, setEmergentCheckMsg] = useState('');
-    const [showEmergentDetails, setShowEmergentDetails] = useState(false);
+    // Keep a ref in sync with the currentAddress state
+    useEffect(() => {
+        addressRef.current = currentAddress;
+    }, [currentAddress]);
 
     // --- WebSocket Real-Time Updates ---
     useEffect(() => {
-        if (!BACKEND_URL) return;
-        let wsUrl = '';
-        try {
-            const url = new URL(BACKEND_URL);
-            wsUrl = (url.protocol === 'https:' ? 'wss://' : 'ws://') + url.host;
-        } catch {
-            wsUrl = BACKEND_URL.replace(/^http/, 'ws');
-        }
+        // This effect runs only once on component mount to establish the connection.
+        let wsUrl = apiClient.defaults.baseURL.replace(/^http/, 'ws');
+        wsUrl = wsUrl.replace(/\/ws$/, '/');
+        if (!wsUrl.endsWith('/')) wsUrl += '/';
+
         const ws = new window.WebSocket(wsUrl);
         wsRef.current = ws;
-        ws.onopen = () => {};
+
+        ws.onopen = () => {
+            console.log('WebSocket connection established');
+        };
+
         ws.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                if (msg.type === 'NEW_EMAIL' && msg.data && msg.data.address === currentAddress) {
+                // Use the ref to access the latest currentAddress without re-triggering the effect
+                if (msg.type === 'NEW_EMAIL' && msg.data && msg.data.address === addressRef.current) {
                     setInbox(prev => [msg.data, ...prev]);
                     setSuccess('New email received!');
                 }
                 if (msg.type === 'NEW_EMERGENT_LOGIN') {
                     setSuccess('A new emergent login was saved.');
                 }
-            } catch (e) {}
+            } catch (e) { console.error('Error parsing WebSocket message:', e); }
         };
-        ws.onerror = () => {};
-        ws.onclose = () => {};
+
+        ws.onerror = (error) => { console.error('WebSocket Error:', error); };
+        ws.onclose = () => { console.log('WebSocket connection closed'); };
+
         return () => {
             ws.close();
         };
-    }, [BACKEND_URL, currentAddress]);
+    }, []); // Empty dependency array ensures this runs only once.
 
     // --- Notification Auto-dismiss ---
     useEffect(() => {
@@ -75,19 +93,14 @@ function App() {
         }
     }, [error, success]);
 
+    const { execute: fetchEmails, isLoading: isInboxLoading } = useApiAction(fetchInbox, {
+        onSuccess: (emails) => {
+            setInbox(emails);
+        },
+        onError: setError,
+    });
+
     // --- Core Logic ---
-    const fetchEmails = async (address) => {
-        if (!address) return;
-        try {
-            const response = await axios.get(`${API}/inbox/${address}`);
-            setInbox(response.data);
-        } catch (err) {
-            setError('Failed to fetch emails.');
-        }
-    };
-
-    // Remove polling logic (no startPolling, stopPolling, intervalRef, isPolling, lastUpdate)
-
     const resetSession = () => {
         setInbox([]);
         setSelectedEmail(null);
@@ -95,16 +108,8 @@ function App() {
         setSuccess('');
     };
 
-    // --- Action Handlers ---
-    const handleGetNewAddress = async () => {
-        setIsLoading(true);
-        resetSession();
-        setCurrentAddress('');
-        setAddressToCheck('');
-        setShowWelcome(false);
-        try {
-            const response = await axios.get(`${API}/new-address`);
-            const newAddress = response.data.address;
+    const { execute: doHandleGetNewAddress, isLoading: isGettingAddress } = useApiAction(getNewAddress, {
+        onSuccess: (newAddress) => {
             if (!newAddress) {
                 setError('No address returned from backend.');
                 return;
@@ -112,53 +117,57 @@ function App() {
             setCurrentAddress(newAddress);
             setSuccess('New address generated!');
             fetchEmails(newAddress);
-        } catch (err) {
-            setError(err.response?.data?.error || 'Failed to get a new address.');
-        } finally {
-            setIsLoading(false);
-        }
+        },
+        onError: setError,
+    });
+
+    const { execute: doHandleLoadAddress, isLoading: isLoadingAddress } = useApiAction(checkAddress, {
+        onSuccess: (data, address) => {
+            if (data.isValid) {
+                setCurrentAddress(address);
+                setSuccess('Address loaded!');
+                fetchEmails(address);
+            } else {
+                setError('This is not a valid or active address from our service.');
+                setCurrentAddress('');
+            }
+        },
+        onError: setError,
+    });
+
+    const handleGetNewAddress = () => {
+        resetSession();
+        setCurrentAddress('');
+        setAddressToCheck('');
+        setShowWelcome(false);
+        doHandleGetNewAddress();
     };
 
-    const handleLoadAddress = async () => {
+    const handleLoadAddress = () => {
         if (!addressToCheck) {
             setError('Please enter an address to load.');
             return;
         }
-        setIsLoading(true);
         resetSession();
         setShowWelcome(false);
-        try {
-            const response = await axios.post(`${API}/check-address`, { address: addressToCheck });
-            if (response.data.isValid) {
-                setCurrentAddress(addressToCheck);
-                setSuccess('Address loaded!');
-                fetchEmails(addressToCheck);
-            } else {
-                setError('This is not a valid address from our service.');
-                setCurrentAddress('');
-            }
-        } catch (err) {
-            setError('Failed to validate the address.');
-        } finally {
-            setIsLoading(false);
-        }
+        doHandleLoadAddress(addressToCheck);
     };
 
-    const handleRetireAddress = async () => {
-        if (!currentAddress) return;
-        const confirmRetire = window.confirm(`Are you sure you want to retire ${currentAddress}? This action cannot be undone.`);
-        if (!confirmRetire) return;
-        resetSession();
-        try {
-            await axios.post(`${API}/mark-used`, { address: currentAddress });
+    const { execute: doHandleRetireAddress, isLoading: isRetiringAddress } = useApiAction(retireAddress, {
+        onSuccess: () => {
             setSuccess('Address retired successfully.');
-            setCurrentAddress('');
             if(currentAddress === addressToCheck) {
               setAddressToCheck('');
             }
-        } catch (err) {
-            setError('Failed to retire address.');
-        }
+            setCurrentAddress('');
+            resetSession();
+        },
+        onError: setError,
+    });
+
+    const handleRetireAddress = () => {
+        const confirmRetire = window.confirm(`Are you sure you want to retire ${currentAddress}? This action cannot be undone.`);
+        if (confirmRetire) doHandleRetireAddress(currentAddress);
     };
 
     const handleCopyToClipboard = async () => {
@@ -168,90 +177,12 @@ function App() {
     };
 
     const handleRefreshInbox = () => {
-        if (currentAddress) fetchEmails(currentAddress);
+        if (currentAddress && !isInboxLoading) fetchEmails(currentAddress);
     };
 
     // --- Helpers & Sanitization ---
     const formatDate = (dateString) => new Date(dateString).toLocaleString();
-    const sanitizeHtml = (html) => html?.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') || '';
-
-    // --- Emergent Login Save Handler ---
-    const handleOpenEmergentModal = (email = '') => {
-        // Defensive: always use string, never object
-        let safeEmail = email;
-        if (typeof safeEmail !== 'string') {
-            if (safeEmail && typeof safeEmail === 'object' && safeEmail.email) {
-                safeEmail = safeEmail.email;
-            } else {
-                safeEmail = '';
-            }
-        }
-        if (!safeEmail && typeof currentAddress === 'string') {
-            safeEmail = currentAddress;
-        }
-        if (typeof safeEmail !== 'string') safeEmail = '';
-        setEmergentEmail(safeEmail);
-        setEmergentName('');
-        setEmergentPassword('');
-        setEmergentSaveMsg('');
-        setShowEmergentModal(true);
-        // Debug log
-        if (safeEmail && typeof safeEmail !== 'string') {
-            console.warn('Emergent email was not a string:', safeEmail);
-        }
-    };
-
-    // --- Emergent Login Check Handler ---
-    const handleOpenEmergentCheck = () => {
-        setEmergentCheckEmail('');
-        setEmergentCheckResult(null);
-        setEmergentCheckMsg('');
-        setShowEmergentCheck(true);
-        setShowEmergentDetails(false);
-    };
-
-    const handleCheckEmergentEmail = async (e) => {
-        e.preventDefault();
-        setEmergentCheckMsg('');
-        setEmergentCheckResult(null);
-        setShowEmergentDetails(false);
-        if (!emergentCheckEmail) {
-            setEmergentCheckMsg('Please enter an email to check.');
-            return;
-        }
-        try {
-            const res = await axios.post(`${API}/check-emergent-login`, { email: emergentCheckEmail });
-            if (res.data && res.data.exists) {
-                setEmergentCheckResult(res.data.login);
-                setEmergentCheckMsg('Details found!');
-            } else {
-                setEmergentCheckResult(null);
-                setEmergentCheckMsg('No details available for this email. You can create one.');
-            }
-        } catch (err) {
-            setEmergentCheckMsg('Failed to check email.');
-        }
-    };
-
-    const handleSaveEmergentLogin = async (e) => {
-        e.preventDefault();
-        setEmergentSaveMsg('');
-        if (!emergentEmail || !emergentName || !emergentPassword) {
-            setEmergentSaveMsg('All fields are required.');
-            return;
-        }
-        try {
-            const res = await axios.post(`${API}/save-emergent-login`, {
-                email: emergentEmail,
-                name: emergentName,
-                password: emergentPassword
-            });
-            setEmergentSaveMsg(res.data?.message || 'Saved!');
-        } catch (err) {
-            console.error('Emergent save error:', err, err.response);
-            setEmergentSaveMsg(err.response?.data?.error || 'Failed to save.');
-        }
-    };
+    const sanitizeHtml = (html) => DOMPurify.sanitize(html || '');
 
     // --- Render ---
     return (
@@ -266,155 +197,23 @@ function App() {
                     </div>
                 </div>
             )}
+            <EmergentAuthModals emergentAuth={emergentAuth} />
             <div className="container mx-auto px-4 py-8 flex-1">
             {/* Emergent Login Save & Check Group */}
             <div className="flex flex-wrap gap-4 justify-end mb-4">
                 <button
                     className="bg-gray-800 text-white px-5 py-2 rounded-lg font-semibold shadow hover:bg-gray-900 transition"
-                    onClick={handleOpenEmergentModal}
+                    onClick={() => emergentAuth.handlers.openSaveModal(currentAddress)}
                 >
                     Emergent.sh Login Save
                 </button>
                 <button
                     className="bg-blue-700 text-white px-5 py-2 rounded-lg font-semibold shadow hover:bg-blue-800 transition"
-                    onClick={handleOpenEmergentCheck}
+                    onClick={emergentAuth.handlers.openCheckModal}
                 >
                     Check Emergent Email
                 </button>
             </div>
-
-            {/* Emergent Login Check Modal */}
-            {showEmergentCheck && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40">
-                    <div className="bg-white rounded-xl shadow-2xl p-8 max-w-md w-full relative">
-                        <button
-                            className="absolute top-3 right-3 text-gray-400 hover:text-gray-700 text-2xl font-bold"
-                            onClick={() => setShowEmergentCheck(false)}
-                            aria-label="Close"
-                        >
-                            &times;
-                        </button>
-                        <h2 className="text-xl font-bold mb-4 text-indigo-700">Check Emergent.sh Email</h2>
-                        <form onSubmit={handleCheckEmergentEmail} className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-                                <input
-                                    type="email"
-                                    className="w-full border border-gray-300 rounded px-3 py-2 font-mono text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                                    value={emergentCheckEmail}
-                                    onChange={e => setEmergentCheckEmail(e.target.value)}
-                                    placeholder="Email address"
-                                    required
-                                />
-                            </div>
-                            <button
-                                type="submit"
-                                className="w-full bg-blue-600 text-white py-2 rounded font-semibold hover:bg-blue-700 transition"
-                            >
-                                Check
-                            </button>
-                        </form>
-                        {emergentCheckMsg && (
-                            <div className={`mt-4 text-center text-sm ${emergentCheckResult ? 'text-green-600' : 'text-red-600'}`}>{emergentCheckMsg}</div>
-                        )}
-                        {emergentCheckResult && !showEmergentDetails && (
-                            <div className="mt-4 flex flex-col items-center gap-2">
-                                <button
-                                    className="bg-indigo-600 text-white px-4 py-2 rounded font-semibold hover:bg-indigo-700 transition"
-                                    onClick={() => setShowEmergentDetails(true)}
-                                >
-                                    View Details
-                                </button>
-                            </div>
-                        )}
-                        {showEmergentDetails && emergentCheckResult && (
-                            <div className="mt-4 bg-gray-50 p-4 rounded text-left">
-                                <div><span className="font-medium">Email:</span> {emergentCheckResult.email}</div>
-                                <div><span className="font-medium">Name:</span> {emergentCheckResult.name}</div>
-                                <div><span className="font-medium">Password:</span> <span className="font-mono">{emergentCheckResult.password}</span></div>
-                                <div><span className="font-medium">Saved At:</span> {formatDate(emergentCheckResult.savedAt)}</div>
-                            </div>
-                        )}
-                        {!emergentCheckResult && (
-                            <div className="mt-4 flex flex-col items-center gap-2">
-                                <button
-                                    className="bg-gray-800 text-white px-4 py-2 rounded font-semibold hover:bg-gray-900 transition"
-                                    onClick={() => {
-                                        setShowEmergentCheck(false);
-                                        // Only pass emergentCheckEmail if it's a string and not empty
-                                        if (typeof emergentCheckEmail === 'string' && emergentCheckEmail.trim() !== '') {
-                                            handleOpenEmergentModal(emergentCheckEmail);
-                                        } else {
-                                            handleOpenEmergentModal('');
-                                        }
-                                    }}
-                                >
-                                    Create New Login
-                                </button>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            )}
-            {/* Emergent Login Modal */}
-            {showEmergentModal && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40">
-                    <div className="bg-white rounded-xl shadow-2xl p-8 max-w-md w-full relative">
-                        <button
-                            className="absolute top-3 right-3 text-gray-400 hover:text-gray-700 text-2xl font-bold"
-                            onClick={() => setShowEmergentModal(false)}
-                            aria-label="Close"
-                        >
-                            &times;
-                        </button>
-                        <h2 className="text-xl font-bold mb-4 text-indigo-700">Emergent.sh Login Save</h2>
-                        <form onSubmit={handleSaveEmergentLogin} className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-                                <input
-                                    type="email"
-                                    className="w-full border border-gray-300 rounded px-3 py-2 font-mono text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                                    value={emergentEmail}
-                                    onChange={e => setEmergentEmail(e.target.value)}
-                                    placeholder="Email address"
-                                    required
-                                />
-                            </div>
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Name</label>
-                                <input
-                                    type="text"
-                                    className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                                    value={emergentName}
-                                    onChange={e => setEmergentName(e.target.value)}
-                                    placeholder="Your name"
-                                    required
-                                />
-                            </div>
-                            <div>
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
-                                <input
-                                    type="password"
-                                    className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                                    value={emergentPassword}
-                                    onChange={e => setEmergentPassword(e.target.value)}
-                                    placeholder="Password"
-                                    required
-                                />
-                            </div>
-                            <button
-                                type="submit"
-                                className="w-full bg-indigo-600 text-white py-2 rounded font-semibold hover:bg-indigo-700 transition"
-                            >
-                                Save
-                            </button>
-                        </form>
-                        {emergentSaveMsg && (
-                            <div className={`mt-4 text-center text-sm ${emergentSaveMsg.includes('Saved') ? 'text-green-600' : 'text-red-600'}`}>{emergentSaveMsg}</div>
-                        )}
-                    </div>
-                </div>
-            )}
                 {/* Header */}
                 <div className="text-center mb-8">
                     <h1 className="text-4xl font-extrabold text-indigo-800 mb-2 tracking-tight drop-shadow">📧 Temp Mail Service</h1>
@@ -426,8 +225,8 @@ function App() {
                     {/* Generate New Address */}
                     <div className="flex-1 flex flex-col items-center gap-3">
                         <h3 className="text-lg font-semibold text-gray-800 mb-2">1. Generate New Address</h3>
-                        <button onClick={handleGetNewAddress} disabled={isLoading} className="bg-green-500 text-white px-8 py-3 rounded-lg text-lg font-bold shadow hover:bg-green-600 disabled:bg-gray-300 transition-all w-full">
-                            {isLoading ? '⏳ Loading...' : '🆕 Generate Email'}
+                        <button onClick={handleGetNewAddress} disabled={isGettingAddress || isLoadingAddress} className="bg-green-500 text-white px-8 py-3 rounded-lg text-lg font-bold shadow hover:bg-green-600 disabled:bg-gray-300 transition-all w-full">
+                            {isGettingAddress ? '⏳ Loading...' : '🆕 Generate Email'}
                         </button>
                         <span className="text-gray-500 text-xs mt-1">Click to get a fresh, unique email address.</span>
                     </div>
@@ -435,8 +234,8 @@ function App() {
                     <div className="flex-1 flex flex-col items-center gap-3 border-t md:border-t-0 md:border-l border-gray-200 pt-6 md:pt-0 md:pl-8">
                         <h3 className="text-lg font-semibold text-gray-800 mb-2">2. Check Previous Address</h3>
                         <div className="flex w-full gap-2">
-                            <input type="email" value={addressToCheck} onChange={e => setAddressToCheck(e.target.value)} placeholder="Paste a previous address" className="flex-1 bg-gray-50 border border-gray-300 rounded-lg px-4 py-2 font-mono text-sm focus:ring-indigo-500 focus:border-indigo-500" disabled={isLoading}/>
-                            <button onClick={handleLoadAddress} disabled={!addressToCheck || isLoading} className="bg-purple-500 text-white px-6 py-2 rounded-lg font-bold hover:bg-purple-600 disabled:bg-gray-300 transition-all">📥 Load</button>
+                            <input type="email" value={addressToCheck} onChange={e => setAddressToCheck(e.target.value)} placeholder="Paste a previous address" className="flex-1 bg-gray-50 border border-gray-300 rounded-lg px-4 py-2 font-mono text-sm focus:ring-indigo-500 focus:border-indigo-500" disabled={isGettingAddress || isLoadingAddress}/>
+                            <button onClick={handleLoadAddress} disabled={!addressToCheck || isGettingAddress || isLoadingAddress} className="bg-purple-500 text-white px-6 py-2 rounded-lg font-bold hover:bg-purple-600 disabled:bg-gray-300 transition-all">{isLoadingAddress ? '⏳ Loading...' : '📥 Load'}</button>
                         </div>
                         <span className="text-gray-500 text-xs mt-1">Check inbox for a previously generated address.</span>
                     </div>
@@ -453,8 +252,8 @@ function App() {
                             </div>
                         </div>
                         <div className="flex flex-col md:flex-row gap-2 md:gap-4 mt-4 md:mt-0 items-center">
-                            <button onClick={handleRefreshInbox} className="bg-blue-500 text-white px-5 py-2 rounded-lg font-medium hover:bg-blue-600 shadow">🔄 Refresh</button>
-                            <button onClick={handleRetireAddress} className="bg-red-500 text-white px-5 py-2 rounded-lg font-medium hover:bg-red-600 shadow">🚫 Retire</button>
+                            <button onClick={handleRefreshInbox} disabled={isGettingAddress || isLoadingAddress || isRetiringAddress || isInboxLoading} className="bg-blue-500 text-white px-5 py-2 rounded-lg font-medium hover:bg-blue-600 shadow disabled:bg-gray-300">{isInboxLoading ? '🔄 Refreshing...' : '🔄 Refresh'}</button>
+                            <button onClick={handleRetireAddress} disabled={isGettingAddress || isLoadingAddress || isRetiringAddress} className="bg-red-500 text-white px-5 py-2 rounded-lg font-medium hover:bg-red-600 shadow disabled:bg-gray-300">{isRetiringAddress ? '🚫 Retiring...' : '🚫 Retire'}</button>
                             <span className="flex items-center text-green-600 text-xs ml-2 mt-2 md:mt-0"><span className="animate-pulse w-2 h-2 bg-green-500 rounded-full mr-2"></span>Real-time auto-refresh enabled</span>
                         </div>
                     </div>
@@ -474,24 +273,27 @@ function App() {
                     <div className="lg:col-span-1 bg-white rounded-xl shadow-lg">
                         <div className="bg-indigo-100 px-4 py-3 border-b rounded-t-xl flex items-center gap-2">
                             <span className="text-xl">📬</span>
-                            <h2 className="text-lg font-bold text-indigo-800">Inbox ({Array.from(new Map(inbox.filter(email => email.subject && email.subject !== '(no subject)').map(e => [e.id, e])).values()).length})</h2>
+                            <h2 className="text-lg font-bold text-indigo-800">Inbox ({uniqueEmails.length})</h2>
                         </div>
                         <div className="max-h-96 overflow-y-auto">
-                            {(() => {
-                                const filtered = inbox.filter(email => email.subject && email.subject !== '(no subject)');
-                                const unique = Array.from(new Map(filtered.map(e => [e.id, e])).values());
-                                if (unique.length === 0) {
-                                    return (
-                                        <div className="p-6 text-center text-gray-500 flex flex-col items-center">
-                                            <div className="text-5xl mb-2">📭</div>
-                                            <p className="mb-2">{currentAddress ? 'No emails yet...' : 'Generate or load an address to see its inbox'}</p>
-                                            {currentAddress && <span className="text-xs text-gray-400">Try sending an email to this address!</span>}
-                                        </div>
-                                    );
-                                }
-                                return (
+                            {isInboxLoading ? (
+                                <div className="flex justify-center items-center p-10">
+                                    <div className="spinner"></div>
+                                </div>
+                            ) : (
+                                uniqueEmails.length === 0 ? (
+                                    <div className="p-6 text-center text-gray-500 flex flex-col items-center">
+                                        <div className="text-5xl mb-2">📭</div>
+                                        <p className="mb-2">
+                                            {currentAddress
+                                                ? 'No emails yet...'
+                                                : 'Generate or load an address to see its inbox'}
+                                        </p>
+                                        {currentAddress && <span className="text-xs text-gray-400">Try sending an email to this address!</span>}
+                                    </div>
+                                ) : (
                                     <div className="divide-y divide-gray-200">
-                                        {unique.map((email) => (
+                                        {uniqueEmails.map((email) => (
                                             <div key={email.id} onClick={() => setSelectedEmail(email)} className={`p-4 cursor-pointer hover:bg-indigo-50 transition-colors ${selectedEmail?.id === email.id ? 'bg-indigo-100 border-r-4 border-indigo-500' : ''}`}>
                                                 <div className="truncate font-semibold text-indigo-900 mb-1">{email.subject}</div>
                                                 <div className="truncate text-sm text-gray-700 mb-1">From: {email.from}</div>
@@ -499,8 +301,8 @@ function App() {
                                             </div>
                                         ))}
                                     </div>
-                                );
-                            })()}
+                                ))
+                            }
                         </div>
                     </div>
                     {/* Email Viewer */}
