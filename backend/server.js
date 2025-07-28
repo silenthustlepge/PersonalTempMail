@@ -12,12 +12,13 @@ const http = require('http');
 const WebSocket = require('ws');
 
 // --- 2. DEFINE CONSTANTS ---
-const PORT = process.env.PORT || 8001;
+const PORT = process.env.PORT || 8001; // Your server runs on port 8001
 const EMAILS_FILE = path.join(__dirname, 'emails.json');
 const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
 const TOKEN_PATH = path.join(__dirname, 'tokens.json');
 const STATE_PATH = path.join(__dirname, 'state.json'); // From old file, for robust sync
 const EMERGENT_LOGINS_FILE = path.join(__dirname, 'emergent_logins.json');
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 // --- 3. INITIALIZE APP & WEBSOCKET SERVER ---
 const app = express();
@@ -26,15 +27,19 @@ const wss = new WebSocket.Server({ server });
 
 // --- 4. APPLY MIDDLEWARE ---
 app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'https://localhost:3000',
-    process.env.REACT_APP_BACKEND_URL,
-    // Add your ngrok URL here if it's static, otherwise this covers development
-  ].filter(Boolean),
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'],
-  credentials: true // Important for some environments
+  origin: (origin, callback) => {
+    // Define allowed origins, including the production URL from .env and common dev URLs
+    const allowedOrigins = [FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'];
+
+    // Allow requests with no origin (like mobile apps or curl requests) and from the allowed list
+    if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+    } else {
+        callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
+  credentials: true
 }));
 app.use(express.json());
 
@@ -49,12 +54,15 @@ function broadcast(data) {
     console.log(`WebSocket broadcasted: ${data.type}`);
 }
 
-wss.on('connection', (ws) => {
-    console.log('✅ WebSocket client connected.');
-    ws.on('close', () => console.log('❌ WebSocket client disconnected.'));
+
+function handleWsConnection(ws, req) {
+    const ip = req.socket.remoteAddress;
+    console.log(`✅ WebSocket client connected from ${ip}`);
+    ws.on('close', () => console.log(`❌ WebSocket client disconnected from ${ip}`));
     ws.on('error', (error) => console.error('WebSocket Error:', error));
     ws.send(JSON.stringify({ type: 'welcome', message: 'Connection to backend established!' }));
-});
+}
+wss.on('connection', handleWsConnection);
 
 // --- 6. IN-MEMORY STORAGE & CLIENTS ---
 let receivedEmails = {};
@@ -101,7 +109,26 @@ async function initializeActiveInboxes() {
     console.log(`✅ Re-initialized ${Object.keys(receivedEmails).length} active inboxes.`);
 }
 
-function parseMessageBody(payload) { if(!payload) return ''; let body = ''; if (payload.parts && payload.parts.length) { if (payload.mimeType === 'multipart/alternative') { const htmlPart = payload.parts.find(p => p.mimeType === 'text/html'); if (htmlPart) { body = parseMessageBody(htmlPart); if(body) return body; } } for (const part of payload.parts) { body = parseMessageBody(part); if (body) return body; } } else if (payload.body && payload.body.data) { return Buffer.from(payload.body.data, 'base64').toString('utf-8'); } return ''; }
+function parseMessageBody(payload) {
+    if (!payload) return '';
+    let body = '';
+
+    if (payload.parts && payload.parts.length) {
+        // For multipart messages, prefer the HTML part
+        if (payload.mimeType === 'multipart/alternative') {
+            const htmlPart = payload.parts.find(p => p.mimeType === 'text/html');
+            if (htmlPart) {
+                body = parseMessageBody(htmlPart);
+                if (body) return body;
+            }
+        }
+        // Fallback to iterating through all parts
+        for (const part of payload.parts) { body = parseMessageBody(part); if (body) return body; }
+    } else if (payload.body && payload.body.data) {
+        return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+    }
+    return '';
+}
 function parseHeader(headers, name) { const header = headers.find(h => h.name.toLowerCase() === name.toLowerCase()); return header ? header.value : ''; }
 function normalizeEmailAddress(headerValue) { if (!headerValue) return ''; const match = headerValue.match(/<(.+)>/); const email = match ? match[1] : headerValue; return email.trim().toLowerCase(); }
 
@@ -110,7 +137,8 @@ function normalizeEmailAddress(headerValue) { if (!headerValue) return ''; const
 // --- Core Temp Mail Routes ---
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-app.get('/api/new-address', async (req, res) => {
+// FIX: Changed route to match frontend service for better versioning practice
+app.get('/api/v1/address/new', async (req, res) => {
     try {
         const emails = await loadEmails();
         const availableEmail = emails.find(e => e && !e.is_used);
@@ -122,19 +150,6 @@ app.get('/api/new-address', async (req, res) => {
         receivedEmails[availableEmail.address] = [];
         res.json({ address: availableEmail.address });
     } catch (error) { res.status(500).json({ error: 'Failed to get new address.' }); }
-});
-
-app.post('/api/mark-used', async (req, res) => {
-    try {
-        const { address } = req.body;
-        if (!address) return res.status(400).json({ error: 'Address is required.' });
-        const emails = await loadEmails();
-        const emailIndex = emails.findIndex(e => e.address === address);
-        if (emailIndex === -1) return res.status(404).json({ error: 'Address not found.' });
-        // No change needed to is_used, "retiring" just means we clear it from memory
-        delete receivedEmails[address];
-        res.json({ message: 'Address retired successfully.' });
-    } catch (error) { res.status(500).json({ error: 'Failed to retire address.' }); }
 });
 
 app.post('/api/check-address', async (req, res) => {
@@ -152,7 +167,25 @@ app.get('/api/inbox/:address', (req, res) => {
     res.json(receivedEmails[address] || []);
 });
 
-// --- Emergent Login Routes ---
+// FIX: Renamed route for clarity and added logic to persist the retired state.
+app.post('/api/retire-address', async (req, res) => {
+    try {
+        const { address } = req.body;
+        if (!address) return res.status(400).json({ error: 'Address is required.' });
+        const emails = await loadEmails();
+        const emailIndex = emails.findIndex(e => e.address?.toLowerCase() === address.toLowerCase());
+        if (emailIndex === -1) return res.status(404).json({ error: 'Address not found.' });
+
+        // Mark the address as no longer in use and save it back to the file system.
+        // This ensures the retired state persists across server restarts.
+        emails[emailIndex].is_used = false;
+        await saveEmails(emails);
+
+        // Also remove it from the active in-memory cache.
+        delete receivedEmails[address];
+        res.json({ message: 'Address retired successfully.' });
+    } catch (error) { res.status(500).json({ error: 'Failed to save login.' }); }
+});
 
 // Save emergent login
 app.post('/api/save-emergent-login', async (req, res) => {
@@ -191,6 +224,7 @@ app.post('/api/check-emergent-login', async (req, res) => {
 
 // --- THE ROBUST PUB/SUB WEBHOOK from the old file, with WebSocket integration ---
 app.post('/webhook/pubsub-push', async (req, res) => {
+    console.log('📬 Pub/Sub webhook called at', new Date().toISOString());
     res.status(204).send(); // Acknowledge immediately
     try {
         let state;
@@ -203,7 +237,10 @@ app.post('/webhook/pubsub-push', async (req, res) => {
         });
 
         const history = historyResponse.data.history;
-        if (!history || history.length === 0) return;
+        if (!history || history.length === 0) {
+            console.log('No new Gmail history records.');
+            return;
+        }
 
         for (const record of history) {
             if (!record.messagesAdded) continue;
@@ -251,6 +288,8 @@ app.post('/webhook/pubsub-push', async (req, res) => {
                     receivedEmails[targetAddress].unshift(emailData);
                     console.log(`✅ Broadcasting INBOX email for ${targetAddress} with subject: "${subject}"`);
                     broadcast({ type: 'NEW_EMAIL', data: emailData });
+                } else {
+                    console.log(`Email for ${targetAddress} received but address is not active.`);
                 }
             }
         }
